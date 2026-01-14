@@ -184,6 +184,22 @@ export async function AnthropicAuthPlugin({ client }) {
               if (body && typeof body === "string") {
                 try {
                   const parsed = JSON.parse(body);
+
+                  // Sanitize system prompt - server blocks "OpenCode" string
+                  if (parsed.system && Array.isArray(parsed.system)) {
+                    parsed.system = parsed.system.map(item => {
+                      if (item.type === 'text' && item.text) {
+                        return {
+                          ...item,
+                          text: item.text
+                            .replace(/OpenCode/g, 'Claude Code')
+                            .replace(/opencode/gi, 'Claude')
+                        };
+                      }
+                      return item;
+                    });
+                  }
+
                   // Add prefix to tools definitions
                   if (parsed.tools && Array.isArray(parsed.tools)) {
                     parsed.tools = parsed.tools.map((tool) => ({
