@@ -1,13 +1,217 @@
 import { generatePKCE } from "@openauthjs/openauth/pkce";
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { access, readFile, writeFile, chmod } from "fs/promises";
-import { join } from "path";
+import { access, readFile, writeFile, chmod, readdir } from "fs/promises";
+import { join, basename } from "path";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
 const TOOL_PREFIX = "mcp_";
+
+// ============================================================================
+// Usage Tracking - Read from OpenCode's Storage
+// ============================================================================
+
+const METRICS_HOST = process.env.ANTHROPIC_USAGE_HOST || "localhost";
+const METRICS_PORT = parseInt(process.env.ANTHROPIC_USAGE_PORT || "9091", 10);
+const OPENCODE_STORAGE = join(process.env.HOME, ".local/share/opencode/storage");
+
+// Anthropic pricing per 1M tokens (latest pricing as of Jan 2025)
+// https://www.anthropic.com/pricing
+const PRICING = {
+  "claude-opus-4-5": { input: 5, output: 25, cacheRead: 0.50, cacheWrite5m: 6.25, cacheWrite1h: 10 },
+  "claude-opus-4": { input: 15, output: 75, cacheRead: 1.50, cacheWrite5m: 18.75, cacheWrite1h: 30 },
+  "claude-sonnet-4-5": { input: 3, output: 15, cacheRead: 0.30, cacheWrite5m: 3.75, cacheWrite1h: 6 },
+  "claude-sonnet-4": { input: 3, output: 15, cacheRead: 0.30, cacheWrite5m: 3.75, cacheWrite1h: 6 },
+  "claude-sonnet-3-5": { input: 3, output: 15, cacheRead: 0.30, cacheWrite5m: 3.75, cacheWrite1h: 6 },
+  "claude-haiku-4-5": { input: 1, output: 5, cacheRead: 0.10, cacheWrite5m: 1.25, cacheWrite1h: 2 },
+  "claude-haiku-3-5": { input: 0.80, output: 4, cacheRead: 0.08, cacheWrite5m: 1, cacheWrite1h: 1.6 },
+  "claude-haiku-3": { input: 0.25, output: 1.25, cacheRead: 0.03, cacheWrite5m: 0.30, cacheWrite1h: 0.50 },
+};
+
+let metricsServer = null;
+
+function calculateCost(model, inputTokens, outputTokens, cacheReadTokens = 0, cacheWriteTokens = 0) {
+  const pricing = PRICING[model] || PRICING["claude-sonnet-4-5"];
+  return (
+    (inputTokens / 1_000_000) * pricing.input +
+    (outputTokens / 1_000_000) * pricing.output +
+    (cacheReadTokens / 1_000_000) * pricing.cacheRead +
+    (cacheWriteTokens / 1_000_000) * pricing.cacheWrite5m
+  );
+}
+
+async function* walkDir(dir) {
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      yield* walkDir(path);
+    } else {
+      yield path;
+    }
+  }
+}
+
+async function getUsageFromStorage() {
+  const messageDir = join(OPENCODE_STORAGE, "message");
+  if (!existsSync(messageDir)) return null;
+
+  const usage = {
+    byAccount: new Map(),
+    overall: {
+      requests: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheTokens: 0,
+      cost: 0,
+    },
+  };
+
+  for await (const filePath of walkDir(messageDir)) {
+    if (!filePath.endsWith(".json")) continue;
+    
+    try {
+      const content = await readFile(filePath, "utf-8");
+      const msg = JSON.parse(content);
+      
+      // Only count assistant messages with cost data
+      if (msg.role !== "assistant") continue;
+      if (typeof msg.cost !== "number") continue;
+      
+      const model = msg.modelID || "unknown";
+      const provider = msg.providerID || "unknown";
+      
+      // Skip non-Anthropic providers
+      if (provider !== "anthropic") continue;
+      
+      const inputTokens = msg.tokens?.input || 0;
+      const outputTokens = (msg.tokens?.output || 0) + (msg.tokens?.reasoning || 0);
+      const cacheRead = msg.tokens?.cache?.read || 0;
+      const cacheWrite = msg.tokens?.cache?.write || 0;
+      const cost = msg.cost || calculateCost(model, inputTokens, outputTokens, cacheRead, cacheWrite);
+      
+      // Use account name from session metadata if available
+      const sessionId = msg.sessionID;
+      const accountKey = msg.mode || "anthropic";
+      
+      if (!usage.byAccount.has(accountKey)) {
+        usage.byAccount.set(accountKey, {
+          accountId: accountKey,
+          accountName: accountKey,
+          requests: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheTokens: 0,
+          cost: 0,
+        });
+      }
+      
+      const accountUsage = usage.byAccount.get(accountKey);
+      accountUsage.requests++;
+      accountUsage.inputTokens += inputTokens;
+      accountUsage.outputTokens += outputTokens;
+      accountUsage.cacheTokens += cacheRead + cacheWrite;
+      accountUsage.cost += cost;
+      
+      usage.overall.requests++;
+      usage.overall.inputTokens += inputTokens;
+      usage.overall.outputTokens += outputTokens;
+      usage.overall.cacheTokens += cacheRead + cacheWrite;
+      usage.overall.cost += cost;
+    } catch (e) {
+      // Skip malformed files
+    }
+  }
+  
+  return usage;
+}
+
+function generateMetrics(usage) {
+  const lines = ["# Anthropic API Usage Metrics", ""];
+  
+  // By account
+  for (const [key, row] of usage.byAccount) {
+    const safeLabel = (row.accountName || row.accountId || "unknown").replace(/"/g, '\\"');
+    lines.push(`# Account: ${safeLabel}`);
+    lines.push(`anthropic_requests_total{account="${safeLabel}",account_id="${row.accountId}"} ${row.requests}`);
+    lines.push(`anthropic_tokens_total{account="${safeLabel}",account_id="${row.accountId}",type="input"} ${row.inputTokens}`);
+    lines.push(`anthropic_tokens_total{account="${safeLabel}",account_id="${row.accountId}",type="output"} ${row.outputTokens}`);
+    lines.push(`anthropic_tokens_total{account="${safeLabel}",account_id="${row.accountId}",type="cache"} ${row.cacheTokens}`);
+    lines.push(`anthropic_cost_usd_total{account="${safeLabel}",account_id="${row.accountId}"} ${row.cost.toFixed(6)}`);
+    lines.push("");
+  }
+  
+  // Overall
+  lines.push("# Overall totals");
+  lines.push(`anthropic_requests_total{account="overall",account_id=""} ${usage.overall.requests}`);
+  lines.push(`anthropic_tokens_total{account="overall",account_id="",type="input"} ${usage.overall.inputTokens}`);
+  lines.push(`anthropic_tokens_total{account="overall",account_id="",type="output"} ${usage.overall.outputTokens}`);
+  lines.push(`anthropic_tokens_total{account="overall",account_id="",type="cache"} ${usage.overall.cacheTokens}`);
+  lines.push(`anthropic_cost_usd_total{account="overall",account_id=""} ${usage.overall.cost.toFixed(6)}`);
+  
+  return lines.join("\n");
+}
+
+function startMetricsServer() {
+  if (metricsServer) return;
+  
+  metricsServer = Bun.serve({
+    hostname: METRICS_HOST,
+    port: METRICS_PORT,
+    fetch: async (request) => {
+      const url = new URL(request.url);
+      
+      if (url.pathname === "/metrics") {
+        const usage = await getUsageFromStorage();
+        if (!usage) {
+          return new Response("# No usage data found\n", { headers: { "Content-Type": "text/plain" } });
+        }
+        return new Response(generateMetrics(usage), {
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
+      
+      if (url.pathname === "/health") {
+        return new Response("OK", { status: 200 });
+      }
+      
+      return new Response("Not Found", { status: 404 });
+    },
+  });
+  
+  console.log(`[anthropic-usage] Metrics server running at http://${METRICS_HOST}:${METRICS_PORT}/metrics`);
+}
+
+function printUsageStats() {
+  console.log("Anthropic API Usage Tracker");
+  console.log("============================\n");
+  
+  // This will be called from CLI with --usage flag
+  getUsageFromStorage().then((usage) => {
+    if (!usage) {
+      console.log("No usage data found.");
+      return;
+    }
+    
+    console.log("Usage by Account:\n");
+    for (const [key, row] of usage.byAccount) {
+      console.log(`${row.accountName} (${row.accountId})`);
+      console.log(`  Requests: ${row.requests}`);
+      console.log(`  Input tokens: ${row.inputTokens.toLocaleString()}`);
+      console.log(`  Output tokens: ${row.outputTokens.toLocaleString()}`);
+      console.log(`  Total cost: $${row.cost.toFixed(4)}`);
+      console.log("");
+    }
+    
+    console.log("Overall:");
+    console.log(`  Total requests: ${usage.overall.requests}`);
+    console.log(`  Total input tokens: ${usage.overall.inputTokens.toLocaleString()}`);
+    console.log(`  Total output tokens: ${usage.overall.outputTokens.toLocaleString()}`);
+    console.log(`  Total cost: $${usage.overall.cost.toFixed(4)}`);
+  });
+}
 
 // ============================================================================
 // Storage Layer - File locking and atomic writes
@@ -317,6 +521,9 @@ async function fetchUserProfile(accessToken) {
 export async function AnthropicAuthPlugin({ client }) {
   const accountManager = await AccountManager.loadFromDisk();
   let hasShownAccountToast = false;
+  
+  // Start metrics server
+  startMetricsServer();
 
   return {
     auth: {
@@ -519,6 +726,26 @@ export async function AnthropicAuthPlugin({ client }) {
               headers: requestHeaders,
             });
 
+            const durationMs = Date.now() - (globalThis._requestStartTime || Date.now());
+
+            // Record usage from response headers
+            const inputTokens = parseInt(response.headers?.get?.("x-anthropic-input-tokens") || "0", 10);
+            const outputTokens = parseInt(response.headers?.get?.("x-anthropic-output-tokens") || "0", 10);
+            const cacheTokens = parseInt(response.headers?.get?.("x-anthropic-cache-tokens") || "0", 10);
+            
+            if (inputTokens > 0 || outputTokens > 0) {
+              // Extract model from request body
+              let model = "unknown";
+              try {
+                if (body && typeof body === "string") {
+                  const parsed = JSON.parse(body);
+                  model = parsed.model || "unknown";
+                }
+              } catch {
+                // ignore parse errors
+              }
+            }
+
             // Handle rate limiting
             if (response.status === 429) {
               const retryAfter = response.headers.get("retry-after");
@@ -719,4 +946,36 @@ export async function AnthropicAuthPlugin({ client }) {
       ],
     },
   };
+}
+
+// ============================================================================
+// CLI for viewing usage stats
+// ============================================================================
+
+if (process.argv[1]?.endsWith("index.mjs") && process.argv.includes("--usage")) {
+  console.log("Anthropic API Usage Tracker");
+  console.log("============================\n");
+
+  getUsageFromStorage().then((usage) => {
+    if (!usage || usage.overall.requests === 0) {
+      console.log("No Anthropic usage data found.");
+      return;
+    }
+
+    console.log("Usage by Account:\n");
+    for (const [key, row] of usage.byAccount) {
+      console.log(`${row.accountName} (${row.accountId})`);
+      console.log(`  Requests: ${row.requests}`);
+      console.log(`  Input tokens: ${row.inputTokens.toLocaleString()}`);
+      console.log(`  Output tokens: ${row.outputTokens.toLocaleString()}`);
+      console.log(`  Total cost: $${row.cost.toFixed(4)}`);
+      console.log("");
+    }
+
+    console.log("Overall:");
+    console.log(`  Total requests: ${usage.overall.requests}`);
+    console.log(`  Total input tokens: ${usage.overall.inputTokens.toLocaleString()}`);
+    console.log(`  Total output tokens: ${usage.overall.outputTokens.toLocaleString()}`);
+    console.log(`  Total cost: $${usage.overall.cost.toFixed(4)}`);
+  });
 }
