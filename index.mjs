@@ -1161,29 +1161,37 @@ async function generateMetrics(usage) {
 function startMetricsServer() {
     if (metricsServer) return;
 
-    metricsServer = Bun.serve({
-        hostname: METRICS_HOST, port: METRICS_PORT, fetch: async (request) => {
-            const url = new URL(request.url);
+    try {
+        metricsServer = Bun.serve({
+            hostname: METRICS_HOST, port: METRICS_PORT, fetch: async (request) => {
+                const url = new URL(request.url);
 
-            if (url.pathname === "/metrics") {
-                const usage = await getUsageFromStorage();
-                if (!usage) {
-                    return new Response("# No usage data found\n", {headers: {"Content-Type": "text/plain"}});
+                if (url.pathname === "/metrics") {
+                    const usage = await getUsageFromStorage();
+                    if (!usage) {
+                        return new Response("# No usage data found\n", {headers: {"Content-Type": "text/plain"}});
+                    }
+                    return new Response(await generateMetrics(usage), {
+                        headers: {"Content-Type": "text/plain; charset=utf-8"},
+                    });
                 }
-                return new Response(await generateMetrics(usage), {
-                    headers: {"Content-Type": "text/plain; charset=utf-8"},
-                });
-            }
 
-            if (url.pathname === "/health") {
-                return new Response("OK", {status: 200});
-            }
+                if (url.pathname === "/health") {
+                    return new Response("OK", {status: 200});
+                }
 
-            return new Response("Not Found", {status: 404});
-        },
-    });
+                return new Response("Not Found", {status: 404});
+            },
+        });
 
-    console.log(`[anthropic-usage] Metrics server running at http://${METRICS_HOST}:${METRICS_PORT}/metrics`);
+        console.log(`[anthropic-usage] Metrics server running at http://${METRICS_HOST}:${METRICS_PORT}/metrics`);
+    } catch (error) {
+        if (error.message && error.message.includes("Failed to start server")) {
+            console.warn(`[anthropic-usage] Port ${METRICS_PORT} already in use, skipping metrics server startup`);
+        } else {
+            console.error(`[anthropic-usage] Failed to start metrics server:`, error);
+        }
+    }
 }
 
 function printUsageStats() {
@@ -2273,8 +2281,12 @@ export async function AnthropicAuthPlugin({client}) {
     const accountManager = await AccountManager.loadFromDisk();
     let hasShownAccountToast = false;
 
-    // Start metrics server
-    startMetricsServer();
+    // Start metrics server (gracefully handle port conflicts)
+    try {
+        startMetricsServer();
+    } catch (error) {
+        console.warn(`[anthropic-usage] Metrics server startup failed, continuing without it:`, error.message);
+    }
 
     // Initialize SQLite DB for granular request tracking
     initRequestsDb();
