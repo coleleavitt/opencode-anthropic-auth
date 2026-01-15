@@ -1158,8 +1158,26 @@ async function generateMetrics(usage) {
     return lines.join("\n");
 }
 
-function startMetricsServer() {
+async function isMetricsServerRunning() {
+    try {
+        const response = await fetch(`http://${METRICS_HOST}:${METRICS_PORT}/health`, {
+            method: 'GET',
+            signal: AbortSignal.timeout(1000),
+        });
+        return response.ok;
+    } catch {
+        return false;
+    }
+}
+
+async function startMetricsServer() {
     if (metricsServer) return;
+
+    const alreadyRunning = await isMetricsServerRunning();
+    if (alreadyRunning) {
+        console.log(`[anthropic-usage] Metrics server already running at http://${METRICS_HOST}:${METRICS_PORT}/metrics (shared instance)`);
+        return;
+    }
 
     try {
         metricsServer = Bun.serve({
@@ -1184,10 +1202,10 @@ function startMetricsServer() {
             },
         });
 
-        console.log(`[anthropic-usage] Metrics server running at http://${METRICS_HOST}:${METRICS_PORT}/metrics`);
+        console.log(`[anthropic-usage] Metrics server started at http://${METRICS_HOST}:${METRICS_PORT}/metrics`);
     } catch (error) {
         if (error.message && error.message.includes("Failed to start server")) {
-            console.warn(`[anthropic-usage] Port ${METRICS_PORT} already in use, skipping metrics server startup`);
+            console.warn(`[anthropic-usage] Port ${METRICS_PORT} already in use by another process, metrics unavailable`);
         } else {
             console.error(`[anthropic-usage] Failed to start metrics server:`, error);
         }
@@ -2283,7 +2301,7 @@ export async function AnthropicAuthPlugin({client}) {
 
     // Start metrics server (gracefully handle port conflicts)
     try {
-        startMetricsServer();
+        await startMetricsServer();
     } catch (error) {
         console.warn(`[anthropic-usage] Metrics server startup failed, continuing without it:`, error.message);
     }
