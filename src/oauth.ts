@@ -30,6 +30,7 @@ export async function exchange(code: string, verifier: string): Promise<OAuthRes
         method: "POST",
         headers: {
             "Content-Type": "application/json",
+            "User-Agent": "claude-cli/2.1.2 (external, cli)",
         },
         body: JSON.stringify({
             code: splits[0],
@@ -63,6 +64,7 @@ export async function refreshAccessToken(refreshToken: RefreshToken): Promise<OA
         method: "POST",
         headers: {
             "Content-Type": "application/json",
+            "User-Agent": "claude-cli/2.1.2 (external, cli)",
         },
         body: JSON.stringify({
             grant_type: "refresh_token",
