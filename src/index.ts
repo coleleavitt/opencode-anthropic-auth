@@ -377,6 +377,55 @@ export async function AnthropicAuthPlugin({client}: PluginContext) {
                         };
                     },
                 },
+                {
+                    provider: "anthropic",
+                    label: "Manually enter API Key",
+                    type: "api",
+                },
+                {
+                    label: "Switch Account",
+                    type: "oauth",
+                    prompts: [
+                        {
+                            type: "select",
+                            key: "account",
+                            message: "Select account to use:",
+                            options: () => {
+                                const accounts = accountManager.getAccounts();
+                                return accounts.map((acc) => ({
+                                    label: acc.fullName ? `${acc.fullName} (${acc.name})` : acc.name,
+                                    value: acc.name,
+                                }));
+                            },
+                        },
+                    ],
+                    authorize: async (inputs: { account: string }) => {
+                        const accounts = accountManager.getAccounts();
+                        const selectedAccount = accounts.find((a) => a.name === inputs.account);
+
+                        if (selectedAccount) {
+                            accountManager.setActiveAccount(inputs.account);
+                            await accountManager.saveToDisk();
+
+                            await client?.tui?.showToast({
+                                body: {
+                                    title: "Account Switched",
+                                    message: `Now using account: ${selectedAccount.name}`,
+                                    variant: "success",
+                                },
+                            }).catch(() => {});
+                        }
+
+                        return {
+                            url: "",
+                            instructions: "",
+                            method: "auto",
+                            callback: async () => {
+                                return { type: "success" };
+                            },
+                        };
+                    },
+                },
             ],
         },
     };
