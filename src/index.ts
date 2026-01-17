@@ -390,13 +390,13 @@ export async function AnthropicAuthPlugin({client}: PluginContext) {
                             type: "select",
                             key: "account",
                             message: "Select account to use:",
-                            options: () => {
+                            options: (() => {
                                 const accounts = accountManager.getAccounts();
                                 return accounts.map((acc) => ({
                                     label: acc.fullName ? `${acc.fullName} (${acc.name})` : acc.name,
                                     value: acc.name,
                                 }));
-                            },
+                            })(),
                         },
                     ],
                     authorize: async (inputs: { account: string }) => {
